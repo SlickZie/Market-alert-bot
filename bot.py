@@ -19,7 +19,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("9291053001:AAH4797Yogl2bW6D2BCJJFKSPDhgPcNHQVo")
 FREE_LIMIT = 2
 PRO_PRICE_STARS = 150
 ALERT_THRESHOLD = 3.0

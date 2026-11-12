@@ -22,7 +22,7 @@ from telegram.ext import (
 # ==========================================
 # 1. CONFIGURATION & SETTINGS
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN","9291053001:AAH4797Yogl2bW6D2BCJJFKSPDhgPcNHQVo")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9291053001:AAH4797Yogl2bW6D2BCJJFKSPDhgPcNHQVo")
 FREE_LIMIT = 2              # Free users can set max 2 alerts
 PRO_PRICE_STARS = 150       # Price for PRO upgrade in Telegram Stars
 ALERT_THRESHOLD = 3.0       # Alert when price changes by >= 3.0%

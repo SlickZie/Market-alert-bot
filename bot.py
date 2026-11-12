@@ -19,16 +19,12 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ==========================================
-# 1. CONFIGURATION & SETTINGS
-# ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FREE_LIMIT = 2              # Free users can set max 2 alerts
-PRO_PRICE_STARS = 150       # Price for PRO upgrade in Telegram Stars
-ALERT_THRESHOLD = 3.0       # Alert when price changes by >= 3.0%
-CHECK_INTERVAL = 600        # Check markets every 600 seconds (10 minutes)
+FREE_LIMIT = 2
+PRO_PRICE_STARS = 150
+ALERT_THRESHOLD = 3.0
+CHECK_INTERVAL = 600
 
-# Available global assets (English labels)
 CRYPTO_ASSETS = {
     "Bitcoin (BTC)": "bitcoin",
     "Ethereum (ETH)": "ethereum",
@@ -46,13 +42,11 @@ STOCK_ASSETS = {
 }
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# 2. DATABASE SETUP (SQLite)
-# ==========================================
 def init_db():
     conn = sqlite3.connect("bot_data.db")
     c = conn.cursor()
@@ -101,14 +95,8 @@ def get_user_subs(user_id: int):
     conn.close()
     return rows
 
-# ==========================================
-# 3. SMART PRICE FETCHER (WITH CACHING)
-# ==========================================
 def fetch_all_prices() -> dict:
-    """Fetches all prices in single batches to prevent API rate limits."""
     prices = {}
-
-    # 1. Fetch Crypto via CoinGecko
     try:
         ids = ",".join(CRYPTO_ASSETS.values())
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
@@ -119,7 +107,6 @@ def fetch_all_prices() -> dict:
     except Exception as e:
         logger.error(f"Error fetching crypto prices: {e}")
 
-    # 2. Fetch Stocks & Indices via Yahoo Finance
     for name, ticker in STOCK_ASSETS.items():
         try:
             data = yf.Ticker(ticker).fast_info
@@ -130,9 +117,6 @@ def fetch_all_prices() -> dict:
 
     return prices
 
-# ==========================================
-# 4. MENUS & TELEGRAM COMMANDS
-# ==========================================
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [
@@ -178,9 +162,6 @@ async def paysupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="Markdown"
     )
 
-# ==========================================
-# 5. BUTTON & INTERACTION HANDLER
-# ==========================================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -204,7 +185,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, asset_type, asset_code, asset_name = data.split("|")
         current_subs = get_user_subs(user_id)
 
-        # Check free tier limit
         if not is_user_pro(user_id) and len(current_subs) >= FREE_LIMIT:
             upgrade_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"⭐ Upgrade to PRO ({PRO_PRICE_STARS} Stars)", callback_data="buy_pro")],
@@ -218,7 +198,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Fetch current baseline price
         prices = fetch_all_prices()
         start_price = prices.get(asset_code, 0.0)
 
@@ -271,9 +250,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         await query.edit_message_text("🗑️ Alert removed.", reply_markup=main_menu_keyboard())
 
-    # ==========================================
-    # 6. TELEGRAM STARS PAYMENT (PRO UPGRADE)
-    # ==========================================
     elif data == "buy_pro":
         if is_user_pro(user_id):
             await query.edit_message_text("⭐ You already have an active PRO account!", reply_markup=main_menu_keyboard())
@@ -284,13 +260,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title="PRO Access - Unlimited Price Alerts",
             description="Track unlimited global cryptocurrencies and stock market indices without restrictions.",
             payload="pro_upgrade_lifetime",
-            provider_token="",  # Must be empty for Telegram Stars!
-            currency="XTR",     # XTR = Telegram Stars currency code
+            provider_token="",
+            currency="XTR",
             prices=[LabeledPrice("PRO Upgrade", PRO_PRICE_STARS)],
         )
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mandatory confirmation within 10 seconds for Telegram Stars."""
     query = update.pre_checkout_query
     if query.invoice_payload != "pro_upgrade_lifetime":
         await query.answer(ok=False, error_message="Invoice verification failed.")
@@ -298,7 +273,6 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer(ok=True)
 
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Activates PRO status immediately after payment."""
     user_id = update.effective_user.id
     set_user_pro(user_id)
     await update.message.reply_text(
@@ -308,9 +282,6 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         reply_markup=main_menu_keyboard()
     )
 
-# ==========================================
-# 7. BACKGROUND TASK (24/7 MARKET CHECKER)
-# ==========================================
 async def check_markets_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Checking markets for price movements...")
     prices = fetch_all_prices()
@@ -340,7 +311,6 @@ async def check_markets_job(context: ContextTypes.DEFAULT_TYPE):
             )
             try:
                 await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
-                # Update baseline price so users aren't spammed continuously
                 c.execute("UPDATE subscriptions SET last_price = ? WHERE id = ?", (current_price, sub_id))
             except Exception as e:
                 logger.warning(f"Failed to send message to user {user_id}: {e}")
@@ -348,24 +318,18 @@ async def check_markets_job(context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-# ==========================================
-# 8. START BOT APPLICATION
-# ==========================================
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("terms", terms_command))
     app.add_handler(CommandHandler("paysupport", paysupport_command))
 
-    # Buttons & Payments
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
 
-    # Background scheduler (runs every 10 minutes)
     app.job_queue.run_repeating(check_markets_job, interval=CHECK_INTERVAL, first=30)
 
     logger.info("Bot successfully started and running 24/7...")

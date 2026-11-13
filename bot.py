@@ -1,521 +1,699 @@
 
+import asyncio
+import logging
 import os
 import re
 import sqlite3
-import html
-from urllib.parse import urlparse
-from datetime import datetime
+from datetime import datetime, timedelta
+from urllib.parse import quote, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import requests
+from bs4 import BeautifulSoup
+from telegram import Update
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
-# ==========================================
+# ==========================================================
 # CONFIGURATIE
-# ==========================================
+# ==========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "booster.db")
+TIMEZONE = ZoneInfo("Europe/Amsterdam")
+DATABASE = os.getenv("DATABASE_PATH", "linkedin_booster.db")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN ontbreekt in de Railway environment variables.")
+DAILY_LIMIT = 10
+DAILY_SCAN_HOUR = 8
+
+PROFILE_URL = (
+    "https://www.linkedin.com/in/"
+    "mark-bouwhuis-a5265727a/"
+)
+
+COMPANY_URL = "https://www.linkedin.com/company/raak-group/"
+
+# Zoektermen gericht op jouw vakgebied.
+SEARCH_TERMS = [
+    "TIG welding Netherlands",
+    "MIG MAG welding Netherlands",
+    "welding inspection Netherlands",
+    "welding coordinator IWT",
+    "IWT IWI welding",
+    "welding QC QA",
+    "piping construction Netherlands",
+    "pipe fitting Belgium",
+    "industrial piping Benelux",
+    "pressure equipment PED",
+    "EN 13480 piping",
+    "gas installation engineering",
+]
+
+# Woorden waarmee we controleren of een bericht relevant is.
+RELEVANCE_WORDS = [
+    "weld", "welding", "lassen", "lasser", "lastechniek",
+    "tig", "mig", "mag", "piping", "pipe", "leidingbouw",
+    "pijpfitter", "iwt", "iwi", "welding coordinator",
+    "welding inspection", "qc", "qa", "inspection",
+    "ped", "en 13480", "en 12732", "pressure equipment",
+    "aardgas", "gas installation", "lasnaad", "lasinspectie",
+    "materiaaltechniek", "engineering",
+]
+
+REGION_WORDS = [
+    "netherlands", "nederland", "belgium", "belgië",
+    "belgique", "luxembourg", "benelux",
+]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9,nl;q=0.8",
+}
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
 
 
-# ==========================================
+# ==========================================================
 # DATABASE
-# ==========================================
+# ==========================================================
 
-def get_connection():
-    return sqlite3.connect(DATABASE_PATH)
+def db_connection():
+    return sqlite3.connect(DATABASE)
 
 
-def init_db():
-    with get_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                url TEXT NOT NULL,
-                post_text TEXT DEFAULT '',
-                impressions INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
+def init_database():
+    with db_connection() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS seen_posts (
+                url TEXT PRIMARY KEY,
+                title TEXT,
+                seen_at TEXT
             )
         """)
-        conn.commit()
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
 
 
-def save_post(user_id, url, post_text):
-    with get_connection() as conn:
-        cursor = conn.execute("""
-            INSERT INTO posts
-            (user_id, url, post_text, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (
-            user_id,
-            url,
-            post_text,
-            datetime.now().strftime("%Y-%m-%d %H:%M")
-        ))
-        conn.commit()
-        return cursor.lastrowid
-
-
-def get_posts(user_id):
-    with get_connection() as conn:
-        return conn.execute("""
-            SELECT id, url, post_text, impressions, created_at
-            FROM posts
-            WHERE user_id = ?
-            ORDER BY id DESC
-        """, (user_id,)).fetchall()
-
-
-def get_post(post_id, user_id):
-    with get_connection() as conn:
-        return conn.execute("""
-            SELECT id, url, post_text, impressions, created_at
-            FROM posts
-            WHERE id = ? AND user_id = ?
-        """, (post_id, user_id)).fetchone()
-
-
-def update_impressions(post_id, user_id, impressions):
-    with get_connection() as conn:
-        conn.execute("""
-            UPDATE posts
-            SET impressions = ?
-            WHERE id = ? AND user_id = ?
-        """, (impressions, post_id, user_id))
-        conn.commit()
-
-
-# ==========================================
-# LINKEDIN LINKCONTROLE
-# ==========================================
-
-def is_valid_linkedin_url(url):
-    try:
-        url = url.strip().strip("<>")
-
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower().split(":")[0]
-
-        valid_domain = (
-            domain == "linkedin.com"
-            or domain.endswith(".linkedin.com")
-            or domain == "lnkd.in"
+def save_chat_id(chat_id):
+    with db_connection() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            ("chat_id", str(chat_id)),
         )
 
-        if not valid_domain:
-            return False
 
-        path = parsed.path.lower()
+def get_chat_id():
+    with db_connection() as db:
+        result = db.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            ("chat_id",),
+        ).fetchone()
 
-        if domain == "lnkd.in":
-            return len(path.strip("/")) > 0
+    return int(result[0]) if result else None
 
-        return (
-            "/posts/" in path
-            or path.startswith("/feed/update/")
-            or path.startswith("/pulse/")
-            or "/activity-" in path
+
+def already_seen(url):
+    with db_connection() as db:
+        result = db.execute(
+            "SELECT url FROM seen_posts WHERE url = ?",
+            (url,),
+        ).fetchone()
+
+    return result is not None
+
+
+def save_post(url, title):
+    with db_connection() as db:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO seen_posts
+            (url, title, seen_at)
+            VALUES (?, ?, ?)
+            """,
+            (url, title, datetime.now(TIMEZONE).isoformat()),
         )
 
-    except Exception:
+
+def get_seen_count():
+    with db_connection() as db:
+        result = db.execute(
+            "SELECT COUNT(*) FROM seen_posts"
+        ).fetchone()
+
+    return result[0]
+
+
+# ==========================================================
+# LINKEDIN OPENBARE ZOEKPAGINA'S
+# ==========================================================
+
+def is_linkedin_post_url(url):
+    parsed = urlparse(url)
+
+    if parsed.netloc not in (
+        "www.linkedin.com",
+        "linkedin.com",
+    ):
         return False
 
+    path = parsed.path.lower()
 
-def clean_url(text):
-    match = re.search(r"https?://\S+|(?:www\.)?linkedin\.com/\S+|lnkd\.in/\S+", text)
-
-    if not match:
-        return text.strip()
-
-    return match.group(0).rstrip(".,;!?)")
-
-
-# ==========================================
-# MENU'S
-# ==========================================
-
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Nieuwe LinkedIn-post", callback_data="new")],
-        [InlineKeyboardButton("📋 Mijn posts", callback_data="posts")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
-    ])
-
-
-def post_menu(post_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Bereik verbeteren", callback_data=f"plan_{post_id}")],
-        [InlineKeyboardButton("💬 Reactiesuggesties", callback_data=f"comments_{post_id}")],
-        [InlineKeyboardButton("📊 Impressies invoeren", callback_data=f"impressions_{post_id}")],
-        [InlineKeyboardButton("⬅️ Terug naar posts", callback_data="posts")]
-    ])
-
-
-# ==========================================
-# START EN HELP
-# ==========================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "👋 Welkom bij LinkedIn Reach Booster!\n\n"
-        "Met deze bot kun je openbare LinkedIn-posts toevoegen, "
-        "ideeën krijgen om je bereik te verbeteren en zelf je impressies bijhouden.\n\n"
-        "Kies een optie:",
-        reply_markup=main_menu()
+    return (
+        "/posts/" in path
+        or "/feed/update/" in path
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ℹ️ Hoe werkt de bot?\n\n"
-        "1. Voeg een openbare LinkedIn-postlink toe.\n"
-        "2. Voeg eventueel de tekst van je post toe.\n"
-        "3. Bekijk ideeën om je bereik te verbeteren.\n"
-        "4. Vraag reactiesuggesties op.\n"
-        "5. Houd zelf je impressies bij.\n\n"
-        "De bot plaatst geen likes, reacties of berichten namens jou."
+def search_linkedin(search_term):
+    search_url = (
+        "https://www.linkedin.com/search/results/content/"
+        "?keywords=" + quote(search_term)
     )
 
-
-# ==========================================
-# CALLBACKS
-# ==========================================
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    data = query.data
-
-    if data == "new":
-        context.user_data["step"] = "waiting_link"
-
-        await query.message.reply_text(
-            "🔗 Plak hier de volledige link van je openbare LinkedIn-post.\n\n"
-            "Voorbeelden:\n"
-            "linkedin.com/posts/gebruikersnaam_onderwerp-123456\n"
-            "linkedin.com/feed/update/urn:li:activity:123456789"
+    try:
+        response = requests.get(
+            search_url,
+            headers=HEADERS,
+            timeout=15,
+            allow_redirects=True,
         )
 
-    elif data == "posts":
-        posts = get_posts(user_id)
-
-        if not posts:
-            await query.message.reply_text(
-                "Je hebt nog geen posts toegevoegd.",
-                reply_markup=main_menu()
+        if response.status_code != 200:
+            logger.warning(
+                "LinkedIn zoekpagina gaf status %s",
+                response.status_code,
             )
-            return
+            return []
 
-        keyboard = []
+        final_url = response.url.lower()
 
-        for post in posts:
-            post_id, url, post_text, impressions, created_at = post
+        if "authwall" in final_url or "login" in final_url:
+            logger.warning("LinkedIn vraagt om inloggen.")
+            return []
 
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"Post #{post_id} – {impressions} impressies",
-                    callback_data=f"select_{post_id}"
+        soup = BeautifulSoup(response.text, "html.parser")
+        results = []
+
+        for link in soup.find_all("a", href=True):
+            url = urljoin(
+                "https://www.linkedin.com",
+                link["href"],
+            )
+
+            if is_linkedin_post_url(url):
+                clean_url = url.split("?")[0]
+
+                if clean_url not in results:
+                    results.append(clean_url)
+
+        return results
+
+    except requests.RequestException as error:
+        logger.warning("Zoekfout: %s", error)
+        return []
+
+
+def read_public_post(url):
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=15,
+            allow_redirects=True,
+        )
+
+        if response.status_code != 200:
+            return None
+
+        if "authwall" in response.url.lower():
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        title = ""
+        description = ""
+
+        og_title = soup.find(
+            "meta",
+            property="og:title",
+        )
+
+        og_description = soup.find(
+            "meta",
+            property="og:description",
+        )
+
+        meta_description = soup.find(
+            "meta",
+            attrs={"name": "description"},
+        )
+
+        if og_title:
+            title = og_title.get("content", "")
+
+        if og_description:
+            description = og_description.get("content", "")
+        elif meta_description:
+            description = meta_description.get("content", "")
+
+        # Extra tekst proberen te lezen uit openbare HTML.
+        if len(description) < 40:
+            main = soup.find("main")
+
+            if main:
+                description = main.get_text(
+                    " ",
+                    strip=True,
                 )
-            ])
 
-        keyboard.append([
-            InlineKeyboardButton("➕ Nieuwe post", callback_data="new")
-        ])
+        text = f"{title} {description}"
+        text = re.sub(r"\s+", " ", text).strip()
 
-        await query.message.reply_text(
-            "📋 Selecteer een post:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        if len(text) < 40:
+            return None
+
+        return {
+            "url": url,
+            "title": title or "LinkedIn bericht",
+            "text": text[:2500],
+        }
+
+    except requests.RequestException as error:
+        logger.warning("Bericht niet leesbaar: %s", error)
+        return None
+
+
+# ==========================================================
+# RELEVANTIE
+# ==========================================================
+
+def relevance_score(text):
+    text = text.lower()
+
+    score = 0
+
+    for word in RELEVANCE_WORDS:
+        if word in text:
+            score += 2
+
+    for word in REGION_WORDS:
+        if word in text:
+            score += 1
+
+    return score
+
+
+def is_relevant(text):
+    return relevance_score(text) >= 2
+
+
+# ==========================================================
+# REACTIES OPSTELLEN
+# ==========================================================
+
+def generate_comments(post_text):
+    text = post_text.lower()
+
+    comments = []
+
+    if any(word in text for word in [
+        "tig", "welding", "lassen", "lasnaad",
+    ]):
+        comments.append(
+            "Interessant onderwerp! De kwaliteit van "
+            "de las begint uiteindelijk al bij een "
+            "goede voorbereiding en beheersing van "
+            "het lasproces."
         )
 
-    elif data == "help":
-        await query.message.reply_text(
-            "ℹ️ Voeg een openbare LinkedIn-post toe. "
-            "Daarna kun je een bereikplan en reactiesuggesties bekijken "
-            "en je impressies handmatig bijhouden."
+    if any(word in text for word in [
+        "inspection", "qc", "qa", "inspectie",
+        "quality", "kwaliteit",
+    ]):
+        comments.append(
+            "Mooi om te zien hoeveel aandacht hiervoor "
+            "is. Goede kwaliteitscontrole tijdens het "
+            "proces voorkomt vaak een hoop herstelwerk "
+            "achteraf."
         )
 
-    elif data.startswith("select_"):
-        post_id = int(data.split("_")[1])
-        post = get_post(post_id, user_id)
+    if any(word in text for word in [
+        "piping", "pipe", "leidingbouw", "pijpfitter",
+    ]):
+        comments.append(
+            "In de leidingbouw zit de kwaliteit vaak "
+            "in de details. Een goede voorbereiding, "
+            "maatvoering en traceerbaarheid maken "
+            "echt het verschil."
+        )
+
+    if any(word in text for word in [
+        "iwt", "iwi", "coordinator", "coördinator",
+    ]):
+        comments.append(
+            "Een interessant vakgebied. Goede "
+            "lascoördinatie vraagt om een combinatie "
+            "van praktijkervaring, materiaal- en "
+            "proceskennis."
+        )
+
+    if any(word in text for word in [
+        "ped", "en 13480", "en 12732",
+        "pressure equipment",
+    ]):
+        comments.append(
+            "Belangrijk onderwerp binnen de "
+            "drukapparatuur en leidingbouw. De "
+            "afstemming tussen ontwerp, uitvoering "
+            "en kwaliteitsborging blijft essentieel."
+        )
+
+    # Algemene reacties als er geen specifieke match is.
+    general_comments = [
+        "Mooi praktijkvoorbeeld uit de technische "
+        "wereld. Juist dit soort kennisdeling is "
+        "waardevol voor vakmensen.",
+
+        "Interessant om te volgen. De combinatie "
+        "van vakmanschap en technische kennis "
+        "blijft belangrijk in onze branche.",
+
+        "Goed dat hier aandacht aan wordt besteed. "
+        "Er valt binnen dit vakgebied altijd iets "
+        "te leren en te verbeteren.",
+    ]
+
+    for comment in general_comments:
+        if len(comments) >= 3:
+            break
+        comments.append(comment)
+
+    return comments[:3]
+
+
+# ==========================================================
+# SCAN
+# ==========================================================
+
+def scan_linkedin():
+    logger.info("LinkedIn scan gestart.")
+
+    found_urls = []
+
+    for term in SEARCH_TERMS:
+        if len(found_urls) >= 50:
+            break
+
+        urls = search_linkedin(term)
+
+        for url in urls:
+            if url not in found_urls:
+                found_urls.append(url)
+
+    posts = []
+
+    for url in found_urls:
+        if already_seen(url):
+            continue
+
+        post = read_public_post(url)
 
         if not post:
-            await query.message.reply_text("Post niet gevonden.")
-            return
+            continue
 
-        _, url, post_text, impressions, created_at = post
+        if not is_relevant(post["text"]):
+            continue
+
+        post["score"] = relevance_score(post["text"])
+        posts.append(post)
+
+    posts.sort(
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+
+    selected = posts[:DAILY_LIMIT]
+
+    for post in selected:
+        save_post(post["url"], post["title"])
+
+    logger.info(
+        "Scan klaar. %s relevante berichten gevonden.",
+        len(selected),
+    )
+
+    return selected
+
+
+# ==========================================================
+# TELEGRAM
+# ==========================================================
+
+async def send_scan_results(bot, chat_id, posts):
+    if not posts:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Vandaag heb ik geen nieuwe openbare "
+                "LinkedIn-berichten kunnen vinden die "
+                "voldoende aansluiten bij jouw vakgebied.\n\n"
+                "Dit kan ook betekenen dat LinkedIn "
+                "anoniem zoeken blokkeert."
+            ),
+        )
+        return
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Ik heb {len(posts)} relevante berichten "
+            "gevonden voor jouw las- en pipingnetwerk."
+        ),
+    )
+
+    for number, post in enumerate(posts, start=1):
+        comments = generate_comments(post["text"])
 
         message = (
-            f"📌 <b>Post #{post_id}</b>\n\n"
-            f"📊 Impressies: {impressions}\n"
-            f"📅 Toegevoegd: {html.escape(created_at)}\n\n"
-            f"🔗 {html.escape(url)}"
+            f"{number}. {post['title']}\n\n"
+            f"Waarom relevant:\n"
+            f"{post['text'][:450]}\n\n"
+            f"LinkedIn bericht:\n"
+            f"{post['url']}\n\n"
+            f"Suggestie 1:\n{comments[0]}\n\n"
+            f"Suggestie 2:\n{comments[1]}\n\n"
+            f"Suggestie 3:\n{comments[2]}"
         )
 
-        if post_text:
-            message += (
-                "\n\n📝 <b>Posttekst:</b>\n"
-                + html.escape(post_text[:1500])
-            )
-
-        await query.message.reply_text(
-            message,
-            parse_mode="HTML",
-            reply_markup=post_menu(post_id),
-            disable_web_page_preview=True
-        )
-
-    elif data.startswith("plan_"):
-        post_id = int(data.split("_")[1])
-        post = get_post(post_id, user_id)
-
-        if not post:
-            await query.message.reply_text("Post niet gevonden.")
-            return
-
-        await query.message.reply_text(
-            "🚀 <b>Bereikplan</b>\n\n"
-            "1. Reageer inhoudelijk op reacties onder je post.\n\n"
-            "2. Deel een aanvullende gedachte in een eigen reactie.\n\n"
-            "3. Reageer op relevante berichten van anderen in jouw vakgebied.\n\n"
-            "4. Stel een gerichte vraag om een gesprek op gang te brengen.\n\n"
-            "5. Deel de post alleen met mensen voor wie de inhoud relevant is.\n\n"
-            "6. Bekijk na 24 en 48 uur hoe het bereik zich ontwikkelt.\n\n"
-            "Tip: inhoudelijke interactie is waardevoller dan willekeurige reacties.",
-            parse_mode="HTML"
-        )
-
-    elif data.startswith("comments_"):
-        post_id = int(data.split("_")[1])
-        post = get_post(post_id, user_id)
-
-        if not post:
-            await query.message.reply_text("Post niet gevonden.")
-            return
-
-        post_text = post[2].lower()
-
-        suggestions = [
-            "Interessant onderwerp! Wat zijn jullie ervaringen hiermee?",
-            "Mooi om te zien hoe dit in de praktijk wordt toegepast.",
-            "Een belangrijk punt. Hier wordt volgens mij nog te weinig aandacht aan besteed.",
-            "Goed om deze ontwikkeling onder de aandacht te brengen.",
-            "Ben benieuwd hoe anderen hier tegenaan kijken."
-        ]
-
-        if any(word in post_text for word in ["lassen", "welding", "leiding", "techniek"]):
-            suggestions = [
-                "Mooi praktijkvoorbeeld! Kwaliteit en vakmanschap blijven hierin belangrijk.",
-                "Interessant om te zien. Welke uitdagingen komen jullie hierbij tegen?",
-                "Goed om technische kennis op deze manier te delen.",
-                "Herkenbaar onderwerp binnen de installatietechniek!",
-                "Mooi werk! Welke normen of richtlijnen zijn hierbij van toepassing?"
-            ]
-
-        message = "💬 <b>Reactiesuggesties</b>\n\n"
-
-        for i, suggestion in enumerate(suggestions, 1):
-            message += f"{i}. {html.escape(suggestion)}\n\n"
-
-        message += "Kies een reactie die bij je past en pas deze eventueel aan."
-
-        await query.message.reply_text(
-            message,
-            parse_mode="HTML"
-        )
-
-    elif data.startswith("impressions_"):
-        post_id = int(data.split("_")[1])
-
-        if not get_post(post_id, user_id):
-            await query.message.reply_text("Post niet gevonden.")
-            return
-
-        context.user_data["step"] = "waiting_impressions"
-        context.user_data["selected_post"] = post_id
-
-        await query.message.reply_text(
-            "📊 Hoeveel impressies heeft deze post momenteel?\n\n"
-            "Voer alleen het getal in, bijvoorbeeld: 1250"
+        await bot.send_message(
+            chat_id=chat_id,
+            text=message[:4000],
+            disable_web_page_preview=True,
         )
 
 
-# ==========================================
-# TEKSTVERWERKING
-# ==========================================
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    step = context.user_data.get("step")
-
-    if step == "waiting_link":
-        url = clean_url(text)
-
-        if not is_valid_linkedin_url(url):
-            await update.message.reply_text(
-                "❌ Dit lijkt geen geldige LinkedIn-postlink.\n\n"
-                "Plak de volledige link van een openbare post. "
-                "Gebruik bijvoorbeeld een link die je via "
-                "'Link kopiëren' op LinkedIn hebt verkregen."
-            )
-            return
-
-        context.user_data["new_post_url"] = url
-        context.user_data["step"] = "waiting_post_text"
-
-        await update.message.reply_text(
-            "✅ Link geaccepteerd!\n\n"
-            "Plak nu de tekst van je LinkedIn-post.\n\n"
-            "Heb je die niet bij de hand? Typ dan /skip."
-        )
-
-    elif step == "waiting_post_text":
-        url = context.user_data.get("new_post_url")
-
-        if not url:
-            context.user_data.clear()
-            await update.message.reply_text(
-                "Er ging iets mis. Begin opnieuw via het menu.",
-                reply_markup=main_menu()
-            )
-            return
-
-        post_id = save_post(user_id, url, text)
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            f"✅ Je LinkedIn-post is opgeslagen!\n\n"
-            f"Postnummer: #{post_id}",
-            reply_markup=post_menu(post_id)
-        )
-
-    elif step == "waiting_impressions":
-        if not text.isdigit():
-            await update.message.reply_text(
-                "❌ Voer alleen een heel getal in, bijvoorbeeld 1250."
-            )
-            return
-
-        impressions = int(text)
-        post_id = context.user_data.get("selected_post")
-
-        if post_id is None:
-            context.user_data.clear()
-            await update.message.reply_text(
-                "Geen post geselecteerd. Begin opnieuw via het menu.",
-                reply_markup=main_menu()
-            )
-            return
-
-        update_impressions(post_id, user_id, impressions)
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            f"✅ Impressies bijgewerkt naar {impressions:,}.".replace(",", "."),
-            reply_markup=main_menu()
-        )
-
-    else:
-        await update.message.reply_text(
-            "Gebruik het menu om een actie te kiezen.",
-            reply_markup=main_menu()
-        )
-
-
-# ==========================================
-# POSTTEKST OVERSLAAN
-# ==========================================
-
-async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("step") != "waiting_post_text":
-        await update.message.reply_text(
-            "Er is geen posttekst om over te slaan."
-        )
-        return
-
-    url = context.user_data.get("new_post_url")
-
-    if not url:
-        context.user_data.clear()
-        await update.message.reply_text(
-            "Begin opnieuw via het menu.",
-            reply_markup=main_menu()
-        )
-        return
-
-    post_id = save_post(update.effective_user.id, url, "")
-
-    context.user_data.clear()
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = update.effective_chat.id
+    save_chat_id(chat_id)
 
     await update.message.reply_text(
-        f"✅ LinkedIn-post opgeslagen zonder posttekst.\n\n"
-        f"Postnummer: #{post_id}",
-        reply_markup=post_menu(post_id)
+        "LinkedIn Reach Booster is actief.\n\n"
+        "Ik zoek naar openbare berichten over lassen, "
+        "piping, leidingbouw, IWT/IWI en QC/QA.\n\n"
+        "Gebruik /scan om direct te zoeken.\n"
+        "Gebruik /status voor de status."
     )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+async def scan_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = update.effective_chat.id
+    save_chat_id(chat_id)
 
     await update.message.reply_text(
-        "Actie geannuleerd.",
-        reply_markup=main_menu()
+        "Ik ga openbare LinkedIn-berichten zoeken. "
+        "Dit kan even duren..."
+    )
+
+    posts = await asyncio.to_thread(scan_linkedin)
+
+    await send_scan_results(
+        context.bot,
+        chat_id,
+        posts,
     )
 
 
-# ==========================================
-# FOUTAFHANDELING
-# ==========================================
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    count = get_seen_count()
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Bot error: {context.error}")
+    await update.message.reply_text(
+        "LinkedIn Reach Booster status:\n\n"
+        "Zoekgebied: Benelux\n"
+        "Daglimiet: 10 berichten\n"
+        "Automatische scan: dagelijks om 08:00\n"
+        "Vakgebied: lassen, piping, QC/QA, IWT/IWI\n"
+        f"Opgeslagen berichten: {count}\n"
+        "Automatisch reageren: UIT\n"
+        "Automatisch publiceren: UIT"
+    )
 
 
-# ==========================================
-# BOT STARTEN
-# ==========================================
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "Beschikbare commando's:\n\n"
+        "/start - Bot activeren\n"
+        "/scan - Direct een zoekronde starten\n"
+        "/status - Status bekijken\n"
+        "/help - Deze uitleg\n\n"
+        "Je plaatst alle reacties zelf op LinkedIn."
+    )
+
+
+# ==========================================================
+# DAGELIJKSE AUTOMATISCHE SCAN
+# ==========================================================
+
+async def daily_scheduler(application):
+    while True:
+        now = datetime.now(TIMEZONE)
+
+        next_scan = now.replace(
+            hour=DAILY_SCAN_HOUR,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        if next_scan <= now:
+            next_scan += timedelta(days=1)
+
+        wait_seconds = (
+            next_scan - now
+        ).total_seconds()
+
+        logger.info(
+            "Volgende scan: %s",
+            next_scan.isoformat(),
+        )
+
+        await asyncio.sleep(wait_seconds)
+
+        chat_id = get_chat_id()
+
+        if not chat_id:
+            continue
+
+        try:
+            posts = await asyncio.to_thread(scan_linkedin)
+
+            await send_scan_results(
+                application.bot,
+                chat_id,
+                posts,
+            )
+
+        except Exception:
+            logger.exception("Dagelijkse scan mislukt.")
+
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Er ging iets mis tijdens de "
+                    "dagelijkse LinkedIn-scan."
+                ),
+            )
+
+
+async def post_init(application):
+    application.bot_data["scheduler_task"] = (
+        asyncio.create_task(
+            daily_scheduler(application)
+        )
+    )
+
+
+async def post_shutdown(application):
+    task = application.bot_data.get("scheduler_task")
+
+    if task:
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+# ==========================================================
+# START
+# ==========================================================
 
 def main():
-    init_db()
+    if not TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN ontbreekt in Railway."
+        )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    init_database()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("skip", skip))
-    application.add_handler(CommandHandler("cancel", cancel))
-
-    application.add_handler(CallbackQueryHandler(button_handler))
-
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
     )
 
-    application.add_error_handler(error_handler)
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
 
-    print("LinkedIn Reach Booster is gestart.")
+    application.add_handler(
+        CommandHandler("scan", scan_command)
+    )
 
-    application.run_polling()
+    application.add_handler(
+        CommandHandler("status", status_command)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    logger.info("LinkedIn Reach Booster gestart.")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":

@@ -1,766 +1,459 @@
 
+import logging
 import os
 import sqlite3
-import logging
-import requests
-import yfinance as yf
+from datetime import datetime, timezone
+from html import escape
+from urllib.parse import urlparse
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    LabeledPrice,
 )
-
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    PreCheckoutQueryHandler,
     MessageHandler,
-    filters,
     ContextTypes,
+    filters,
 )
-
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN ontbreekt in Railway Variables")
-
-FREE_LIMIT = 2
-PRO_PRICE_STARS = 150
-ALERT_THRESHOLD = 3.0
-CHECK_INTERVAL = 600
-
-CRYPTO_ASSETS = {
-    "Bitcoin (BTC)": "bitcoin",
-    "Ethereum (ETH)": "ethereum",
-    "Solana (SOL)": "solana",
-    "Ripple (XRP)": "ripple",
-    "Cardano (ADA)": "cardano",
-}
-
-STOCK_ASSETS = {
-    "S&P 500 Index": "^GSPC",
-    "NASDAQ Composite": "^IXIC",
-    "Dow Jones": "^DJI",
-    "Gold (Futures)": "GC=F",
-    "Nvidia (NVDA)": "NVDA",
-}
-
-
-# ==========================================
-# LOGGING
-# ==========================================
+DB_PATH = os.getenv("DATABASE_PATH", "bot_data.db")
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
-
 logger = logging.getLogger(__name__)
 
+WAITING_LINK = "waiting_link"
+WAITING_TEXT = "waiting_text"
+WAITING_IMPRESSIONS = "waiting_impressions"
 
-# ==========================================
-# DATABASE
-# ==========================================
+
+def database():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def init_db():
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            is_pro INTEGER DEFAULT 0
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            asset_name TEXT,
-            asset_type TEXT,
-            asset_code TEXT,
-            last_price REAL DEFAULT 0,
-            UNIQUE(user_id, asset_code)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+    with database() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                post_text TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, url)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS measurements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                impressions INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+        """)
 
 
-def is_user_pro(user_id: int) -> bool:
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute(
-        "INSERT OR IGNORE INTO users (user_id, is_pro) VALUES (?, 0)",
-        (user_id,)
-    )
-
-    conn.commit()
-
-    c.execute(
-        "SELECT is_pro FROM users WHERE user_id = ?",
-        (user_id,)
-    )
-
-    result = c.fetchone()[0]
-    conn.close()
-
-    return bool(result)
-
-
-def set_user_pro(user_id: int):
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute(
-        "INSERT OR IGNORE INTO users (user_id, is_pro) VALUES (?, 0)",
-        (user_id,)
-    )
-
-    c.execute(
-        "UPDATE users SET is_pro = 1 WHERE user_id = ?",
-        (user_id,)
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def get_user_subs(user_id: int):
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute("""
-        SELECT asset_name, asset_type, asset_code, last_price
-        FROM subscriptions
-        WHERE user_id = ?
-    """, (user_id,))
-
-    rows = c.fetchall()
-    conn.close()
-
-    return rows
-
-
-# ==========================================
-# CRYPTO PRICE FETCHING
-# ==========================================
-
-def fetch_crypto_prices() -> dict:
-    prices = {}
-
-    try:
-        ids = ",".join(CRYPTO_ASSETS.values())
-
-        url = (
-            "https://api.coingecko.com/api/v3/simple/price"
-            f"?ids={ids}&vs_currencies=usd"
-        )
-
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-
-        data = response.json()
-
-        for name, cg_id in CRYPTO_ASSETS.items():
-            if cg_id in data and "usd" in data[cg_id]:
-                prices[cg_id] = float(data[cg_id]["usd"])
-                logger.info(
-                    f"Crypto price received: {name} = {prices[cg_id]}"
-                )
-            else:
-                logger.warning(f"No crypto price available for {name}")
-
-    except Exception as e:
-        logger.error(f"Crypto price error: {e}")
-
-    return prices
-
-
-# ==========================================
-# STOCK AND INDEX PRICE FETCHING
-# ==========================================
-
-def fetch_stock_price(ticker: str):
-    try:
-        stock = yf.Ticker(ticker)
-
-        # Eerst recente intraday-koersen proberen
-        history = stock.history(
-            period="1d",
-            interval="1m",
-            auto_adjust=False
-        )
-
-        if not history.empty:
-            closes = history["Close"].dropna()
-
-            if not closes.empty:
-                price = float(closes.iloc[-1])
-
-                if price > 0:
-                    return price
-
-        # Fallback: meest recente dagelijkse slotkoers
-        history = stock.history(
-            period="5d",
-            interval="1d",
-            auto_adjust=False
-        )
-
-        if not history.empty:
-            closes = history["Close"].dropna()
-
-            if not closes.empty:
-                price = float(closes.iloc[-1])
-
-                if price > 0:
-                    return price
-
-        logger.warning(f"No valid price for {ticker}")
-        return None
-
-    except Exception as e:
-        logger.error(f"Error fetching {ticker}: {e}")
-        return None
-
-
-# ==========================================
-# FETCH ALL MARKET PRICES
-# ==========================================
-
-def fetch_all_prices() -> dict:
-    prices = {}
-
-    # Crypto ophalen
-    crypto_prices = fetch_crypto_prices()
-    prices.update(crypto_prices)
-
-    # Aandelen en indices ophalen
-    for name, ticker in STOCK_ASSETS.items():
-        price = fetch_stock_price(ticker)
-
-        if price is not None:
-            prices[ticker] = price
-            logger.info(f"Market price received: {name} = {price}")
-        else:
-            logger.warning(f"Market price unavailable: {name} ({ticker})")
-
-    return prices
-
-
-# ==========================================
-# TELEGRAM MAIN MENU
-# ==========================================
-
-def main_menu_keyboard():
+def menu():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🪙 Add Crypto",
-                callback_data="menu_crypto"
-            ),
-            InlineKeyboardButton(
-                "📈 Add Stock / Index",
-                callback_data="menu_stock"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📊 My Watchlist & Prices",
-                callback_data="my_alerts"
-            ),
-            InlineKeyboardButton(
-                "🗑️ Remove Alert",
-                callback_data="delete_menu"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "⭐ Upgrade to PRO (Unlimited)",
-                callback_data="buy_pro"
-            ),
-        ],
+        [InlineKeyboardButton("➕ Post toevoegen", callback_data="add")],
+        [InlineKeyboardButton("📚 Mijn posts", callback_data="posts")],
+        [InlineKeyboardButton("📊 Statistieken", callback_data="stats")],
+        [InlineKeyboardButton("ℹ️ Uitleg", callback_data="info")],
     ])
 
 
-# ==========================================
-# START COMMAND
-# ==========================================
+def valid_link(url):
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        return (
+            parsed.scheme in ("https", "http")
+            and (host == "linkedin.com" or host.endswith(".linkedin.com"))
+        )
+    except Exception:
+        return False
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+
+def get_post(post_id, user_id):
+    with database() as conn:
+        return conn.execute(
+            "SELECT * FROM posts WHERE id=? AND user_id=?",
+            (post_id, user_id),
+        ).fetchone()
+
+
+def get_posts(user_id):
+    with database() as conn:
+        return conn.execute(
+            "SELECT * FROM posts WHERE user_id=? ORDER BY id DESC",
+            (user_id,),
+        ).fetchall()
+
+
+def topic(text):
+    text = (text or "").lower()
+
+    categories = [
+        (["lassen", "laswerk", "kwaliteit", "qc", "qa"], "kwaliteit en vakmanschap"),
+        (["project", "leiding", "installatie", "bouw"], "het project"),
+        (["vacature", "collega", "werken"], "de vacature"),
+        (["opleiding", "diploma", "leren", "iwt"], "ontwikkeling en vakmanschap"),
+        (["team", "samenwerking"], "de samenwerking"),
+    ]
+
+    for words, result in categories:
+        if any(word in text for word in words):
+            return result
+
+    return "dit onderwerp"
+
+
+def suggestions(text):
+    subject = topic(text)
+
+    return [
+        f"Mooi om te zien dat {subject} aandacht krijgt. Wat was hierin de grootste uitdaging?",
+        f"Interessant om te lezen. Hoe hebben jullie dit in de praktijk aangepakt?",
+        f"Mooi resultaat! Welke ervaring nemen jullie mee naar een volgend project?",
+    ]
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "🚀 LINKEDIN REACH BOOSTER\n\n"
+        "Selecteer bestaande LinkedIn-posts en maak een plan "
+        "om de organische zichtbaarheid te vergroten.\n\n"
+        "Geen automatische likes of reacties.",
+        reply_markup=menu(),
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("state")
+    text = (update.message.text or "").strip()
     user_id = update.effective_user.id
 
-    pro_status = (
-        "⭐ PRO"
-        if is_user_pro(user_id)
-        else f"Free (max {FREE_LIMIT} alerts)"
-    )
+    if state == WAITING_LINK:
 
-    welcome_text = (
-        f"👋 *Welcome to Global Market Alert Bot!*\n\n"
-        f"Status: *{pro_status}*\n\n"
-        f"Select what you want to track below. "
-        f"You will automatically receive an instant notification "
-        f"when a price moves by more than *{ALERT_THRESHOLD}%*.\n\n"
-        f"_Disclaimer: This bot provides automated market data only "
-        f"and does not constitute financial advice._"
-    )
+        if not valid_link(text):
+            await update.message.reply_text(
+                "Dit lijkt geen geldige LinkedIn-link."
+            )
+            return
+
+        context.user_data["pending_url"] = text
+        context.user_data["state"] = WAITING_TEXT
+
+        await update.message.reply_text(
+            "Link ontvangen!\n\n"
+            "Plak nu de tekst van de LinkedIn-post.\n"
+            "Of stuur OVERSLAAN."
+        )
+        return
+
+    if state == WAITING_TEXT:
+
+        post_text = "" if text.lower() == "overslaan" else text[:12000]
+
+        with database() as conn:
+            conn.execute(
+                """
+                INSERT INTO posts
+                (user_id, url, post_text, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, url)
+                DO UPDATE SET post_text=excluded.post_text
+                """,
+                (
+                    user_id,
+                    context.user_data["pending_url"],
+                    post_text,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            "✅ LinkedIn-post opgeslagen!",
+            reply_markup=menu(),
+        )
+        return
+
+    if state == WAITING_IMPRESSIONS:
+
+        if not text.isdigit():
+            await update.message.reply_text(
+                "Stuur alleen een getal, bijvoorbeeld 1250."
+            )
+            return
+
+        post_id = context.user_data["post_id"]
+
+        with database() as conn:
+            conn.execute(
+                """
+                INSERT INTO measurements
+                (post_id, user_id, impressions, recorded_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    post_id,
+                    user_id,
+                    int(text),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            "📊 Impressies opgeslagen!",
+            reply_markup=menu(),
+        )
+        return
 
     await update.message.reply_text(
-        welcome_text,
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
+        "Gebruik /start om het menu te openen."
     )
 
 
-# ==========================================
-# TERMS COMMAND
-# ==========================================
+async def show_posts(query, user_id):
+    posts = get_posts(user_id)
 
-async def terms_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.message.reply_text(
-        "📜 *Terms of Service:*\n"
-        "1. This bot provides automated market data and price alerts.\n"
-        "2. We do not offer financial or investment advice.\n"
-        "3. Digital upgrades via Telegram Stars are activated instantly.",
-        parse_mode="Markdown"
+    if not posts:
+        await query.edit_message_text(
+            "Je hebt nog geen posts opgeslagen.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Toevoegen", callback_data="add")]
+            ]),
+        )
+        return
+
+    buttons = []
+
+    for post in posts[:20]:
+        label = post["post_text"] or post["url"]
+        label = label.replace("\n", " ")[:35]
+
+        buttons.append([
+            InlineKeyboardButton(
+                "📌 " + label,
+                callback_data=f"post:{post['id']}",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton("⬅️ Hoofdmenu", callback_data="home")
+    ])
+
+    await query.edit_message_text(
+        "Kies een bestaande LinkedIn-post:",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-# ==========================================
-# PAYMENT SUPPORT
-# ==========================================
+async def show_post(query, post_id, user_id):
+    post = get_post(post_id, user_id)
 
-async def paysupport_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.message.reply_text(
-        "💬 *Payment Support:*\n\n"
-        "Have questions about payments with Telegram Stars? "
-        "Reach out to our support team directly via Telegram.",
-        parse_mode="Markdown"
+    if not post:
+        await query.edit_message_text("Post niet gevonden.")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Boostplan", callback_data=f"boost:{post_id}")],
+        [InlineKeyboardButton("💬 Reactiesuggesties", callback_data=f"comments:{post_id}")],
+        [InlineKeyboardButton("📊 Impressies invoeren", callback_data=f"measure:{post_id}")],
+        [InlineKeyboardButton("🔗 Open LinkedIn", url=post["url"])],
+        [InlineKeyboardButton("⬅️ Terug", callback_data="posts")],
+    ])
+
+    await query.edit_message_text(
+        f"📌 POST #{post_id}\n\n"
+        f"{escape((post['post_text'] or 'Geen posttekst opgeslagen')[:500])}",
+        parse_mode="HTML",
+        reply_markup=keyboard,
     )
 
 
-# ==========================================
-# BUTTON HANDLER
-# ==========================================
+async def show_boost(query, post_id, user_id):
+    post = get_post(post_id, user_id)
 
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    if not post:
+        await query.edit_message_text("Post niet gevonden.")
+        return
+
+    await query.edit_message_text(
+        "🚀 ORGANISCH BOOSTPLAN\n\n"
+        "1. Deel een persoonlijke ervaring die aansluit bij de post.\n"
+        "2. Stel een relevante vraag.\n"
+        "3. Reageer inhoudelijk op antwoorden.\n"
+        "4. Deel de post alleen met mensen voor wie hij relevant is.\n"
+        "5. Meet later de ontwikkeling van de impressies.\n\n"
+        "Extra bereik is niet gegarandeerd.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Reacties", callback_data=f"comments:{post_id}")],
+            [InlineKeyboardButton("🔗 Open post", url=post["url"])],
+            [InlineKeyboardButton("⬅️ Terug", callback_data=f"post:{post_id}")],
+        ]),
+    )
+
+
+async def show_comments(query, post_id, user_id):
+    post = get_post(post_id, user_id)
+
+    if not post or not post["post_text"]:
+        await query.edit_message_text(
+            "Ik heb eerst de tekst van de post nodig."
+        )
+        return
+
+    comments = suggestions(post["post_text"])
+
+    keyboard = []
+
+    for i in range(len(comments)):
+        keyboard.append([
+            InlineKeyboardButton(
+                f"Reactie {i + 1}",
+                callback_data=f"comment:{post_id}:{i}",
+            )
+        ])
+
+    await query.edit_message_text(
+        "💬 Kies een reactiesuggestie:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def show_comment(query, post_id, index, user_id):
+    post = get_post(post_id, user_id)
+
+    if not post:
+        await query.edit_message_text("Post niet gevonden.")
+        return
+
+    comments = suggestions(post["post_text"])
+
+    if index >= len(comments):
+        return
+
+    await query.edit_message_text(
+        "💬 Reactiesuggestie:\n\n" + comments[index],
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 Open LinkedIn", url=post["url"])],
+            [InlineKeyboardButton("⬅️ Terug", callback_data=f"comments:{post_id}")],
+        ]),
+    )
+
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
     data = query.data
 
-    # Back to main menu
-    if data == "back_main":
+    if data == "home":
+        context.user_data.clear()
         await query.edit_message_text(
-            "Main Menu:",
-            reply_markup=main_menu_keyboard()
+            "🚀 LINKEDIN REACH BOOSTER",
+            reply_markup=menu(),
         )
 
-    # Crypto menu
-    elif data == "menu_crypto":
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    name,
-                    callback_data=f"add|crypto|{code}|{name}"
-                )
-            ]
-            for name, code in CRYPTO_ASSETS.items()
-        ]
-
-        buttons.append([
-            InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="back_main"
-            )
-        ])
-
+    elif data == "add":
+        context.user_data["state"] = WAITING_LINK
         await query.edit_message_text(
-            "Choose a *Crypto* to track:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons)
+            "Stuur de volledige LinkedIn-postlink."
         )
 
-    # Stocks and indices menu
-    elif data == "menu_stock":
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    name,
-                    callback_data=f"add|stock|{code}|{name}"
-                )
-            ]
-            for name, code in STOCK_ASSETS.items()
-        ]
+    elif data == "posts":
+        context.user_data.clear()
+        await show_posts(query, user_id)
 
-        buttons.append([
-            InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="back_main"
-            )
-        ])
+    elif data == "stats":
+        with database() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM posts WHERE user_id=?",
+                (user_id,),
+            ).fetchone()[0]
+
+            measurements = conn.execute(
+                "SELECT COUNT(*) FROM measurements WHERE user_id=?",
+                (user_id,),
+            ).fetchone()[0]
 
         await query.edit_message_text(
-            "Choose a *Stock / Index* to track:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons)
+            f"📊 STATISTIEKEN\n\n"
+            f"Opgeslagen posts: {count}\n"
+            f"Impressiemetingen: {measurements}\n\n"
+            "Impressies voer je handmatig in via LinkedIn."
         )
 
-    # Add asset
-    elif data.startswith("add|"):
-        _, asset_type, asset_code, asset_name = data.split("|")
+    elif data == "info":
+        await query.edit_message_text(
+            "Voeg een postlink toe, plak de tekst en selecteer "
+            "de post om een boostplan te bekijken."
+        )
 
-        current_subs = get_user_subs(user_id)
+    elif data.startswith("post:"):
+        await show_post(query, int(data.split(":")[1]), user_id)
 
-        if (
-            not is_user_pro(user_id)
-            and len(current_subs) >= FREE_LIMIT
-        ):
-            upgrade_kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        f"⭐ Upgrade to PRO ({PRO_PRICE_STARS} Stars)",
-                        callback_data="buy_pro"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="back_main"
-                    )
-                ]
-            ])
+    elif data.startswith("boost:"):
+        await show_boost(query, int(data.split(":")[1]), user_id)
 
-            await query.edit_message_text(
-                f"⚠️ You have reached the limit of "
-                f"*{FREE_LIMIT} free alerts*.\n\n"
-                "Upgrade to PRO to track unlimited crypto and stocks!",
-                parse_mode="Markdown",
-                reply_markup=upgrade_kb
-            )
+    elif data.startswith("comments:"):
+        await show_comments(query, int(data.split(":")[1]), user_id)
 
-            return
+    elif data.startswith("comment:"):
+        _, post_id, index = data.split(":")
+        await show_comment(query, int(post_id), int(index), user_id)
 
-        # Fetch actual price before saving
-        prices = fetch_all_prices()
-        start_price = prices.get(asset_code)
+    elif data.startswith("measure:"):
+        post_id = int(data.split(":")[1])
 
-        if start_price is None or start_price <= 0:
-            await query.edit_message_text(
-                f"⚠️ Could not retrieve a valid price for "
-                f"*{asset_name}*.\n\n"
-                "Please try again later.",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
-            )
-            return
-
-        conn = sqlite3.connect("bot_data.db")
-        c = conn.cursor()
-
-        c.execute("""
-            INSERT OR REPLACE INTO subscriptions
-            (user_id, asset_name, asset_type, asset_code, last_price)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            asset_name,
-            asset_type,
-            asset_code,
-            start_price
-        ))
-
-        conn.commit()
-        conn.close()
+        context.user_data["state"] = WAITING_IMPRESSIONS
+        context.user_data["post_id"] = post_id
 
         await query.edit_message_text(
-            f"✅ *{asset_name}* added successfully!\n\n"
-            f"Baseline price: `${start_price:,.2f}`\n\n"
-            f"You will be alerted upon a "
-            f"{ALERT_THRESHOLD}% price movement.",
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard()
-        )
-
-    # Show watchlist
-    elif data == "my_alerts":
-        subs = get_user_subs(user_id)
-
-        if not subs:
-            await query.edit_message_text(
-                "You are not tracking any assets yet.",
-                reply_markup=main_menu_keyboard()
-            )
-            return
-
-        prices = fetch_all_prices()
-        lines = ["📊 *Your Active Watchlist:*\n"]
-
-        for name, _, code, last_price in subs:
-            curr_price = prices.get(code, last_price)
-
-            lines.append(
-                f"• *{name}*: `${curr_price:,.2f}`"
-            )
-
-        await query.edit_message_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard()
-        )
-
-    # Delete menu
-    elif data == "delete_menu":
-        subs = get_user_subs(user_id)
-
-        if not subs:
-            await query.edit_message_text(
-                "You have no active alerts to delete.",
-                reply_markup=main_menu_keyboard()
-            )
-            return
-
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    f"❌ {name}",
-                    callback_data=f"del|{code}"
-                )
-            ]
-            for name, _, code, _ in subs
-        ]
-
-        buttons.append([
-            InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="back_main"
-            )
-        ])
-
-        await query.edit_message_text(
-            "Select an alert to remove:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-    # Delete asset
-    elif data.startswith("del|"):
-        code = data.split("|", 1)[1]
-
-        conn = sqlite3.connect("bot_data.db")
-        c = conn.cursor()
-
-        c.execute(
-            "DELETE FROM subscriptions "
-            "WHERE user_id = ? AND asset_code = ?",
-            (user_id, code)
-        )
-
-        conn.commit()
-        conn.close()
-
-        await query.edit_message_text(
-            "🗑️ Alert removed.",
-            reply_markup=main_menu_keyboard()
-        )
-
-    # Buy PRO
-    elif data == "buy_pro":
-        if is_user_pro(user_id):
-            await query.edit_message_text(
-                "⭐ You already have an active PRO account!",
-                reply_markup=main_menu_keyboard()
-            )
-            return
-
-        await context.bot.send_invoice(
-            chat_id=user_id,
-            title="PRO Access - Unlimited Price Alerts",
-            description=(
-                "Track unlimited global cryptocurrencies "
-                "and stock market indices without restrictions."
-            ),
-            payload="pro_upgrade_lifetime",
-            provider_token="",
-            currency="XTR",
-            prices=[
-                LabeledPrice("PRO Upgrade", PRO_PRICE_STARS)
-            ],
+            "Hoeveel impressies heeft deze post momenteel?"
         )
 
 
-# ==========================================
-# PAYMENT CALLBACKS
-# ==========================================
+async def error_handler(update, context):
+    logger.exception("Bot error", exc_info=context.error)
 
-async def precheckout_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.pre_checkout_query
-
-    if query.invoice_payload != "pro_upgrade_lifetime":
-        await query.answer(
-            ok=False,
-            error_message="Invoice verification failed."
-        )
-    else:
-        await query.answer(ok=True)
-
-
-async def successful_payment_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user_id = update.effective_user.id
-
-    set_user_pro(user_id)
-
-    await update.message.reply_text(
-        "🎉 *Payment successful! You are now PRO.*\n\n"
-        "You can now add unlimited assets to your watchlist.",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-
-# ==========================================
-# MARKET MONITORING
-# ==========================================
-
-async def check_markets_job(
-    context: ContextTypes.DEFAULT_TYPE
-):
-    logger.info("Checking markets for price movements...")
-
-    prices = fetch_all_prices()
-
-    if not prices:
-        logger.warning("No market prices received.")
-        return
-
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute("""
-        SELECT id, user_id, asset_name, asset_code, last_price
-        FROM subscriptions
-    """)
-
-    all_subs = c.fetchall()
-
-    for sub_id, user_id, name, code, last_price in all_subs:
-
-        if code not in prices or last_price <= 0:
-            continue
-
-        current_price = prices[code]
-
-        pct_change = (
-            (current_price - last_price) / last_price
-        ) * 100
-
-        if abs(pct_change) >= ALERT_THRESHOLD:
-
-            direction = (
-                "🚀 SURGE"
-                if pct_change > 0
-                else "🔻 DROP"
-            )
-
-            msg = (
-                f"{direction} *PRICE ALERT: {name}*\n\n"
-                f"Movement: *{pct_change:+.2f}%*\n"
-                f"Previous baseline: `${last_price:,.2f}`\n"
-                f"Current price: `${current_price:,.2f}`\n\n"
-                f"💡 _Tip: Always do your own research before trading._"
-            )
-
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=msg,
-                    parse_mode="Markdown"
-                )
-
-                c.execute(
-                    "UPDATE subscriptions SET last_price = ? WHERE id = ?",
-                    (current_price, sub_id)
-                )
-
-                logger.info(
-                    f"Alert sent: {name} ({pct_change:+.2f}%)"
-                )
-
-            except Exception as e:
-                logger.warning(
-                    f"Failed to send message to user {user_id}: {e}"
-                )
-
-    conn.commit()
-    conn.close()
-
-
-# ==========================================
-# MAIN
-# ==========================================
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN ontbreekt in Railway Variables.")
+
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("terms", terms_command))
-    app.add_handler(CommandHandler("paysupport", paysupport_command))
-
-    app.add_handler(CallbackQueryHandler(button_handler))
-
+    app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(
-        PreCheckoutQueryHandler(precheckout_callback)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
+    app.add_error_handler(error_handler)
 
-    app.add_handler(
-        MessageHandler(
-            filters.SUCCESSFUL_PAYMENT,
-            successful_payment_callback
-        )
-    )
+    logger.info("LinkedIn Booster gestart.")
 
-    app.job_queue.run_repeating(
-        check_markets_job,
-        interval=CHECK_INTERVAL,
-        first=30
-    )
-
-    logger.info("Bot successfully started and running 24/7...")
-
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
